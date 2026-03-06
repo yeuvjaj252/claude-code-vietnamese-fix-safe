@@ -8,6 +8,7 @@ the backspace handling logic to also insert replacement text.
 Supports:
 - npm install -g @anthropic-ai/claude-code
 - curl -fsSL https://claude.ai/install.sh | bash (official installer)
+- claude.ai versioned installer (~/.local/share/claude/versions/*)
 
 Safety features:
 - Dry-run mode (no changes)
@@ -33,6 +34,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +78,26 @@ def get_resolved_path(path: Path):
         return path
 
 
+def search_js_files_in_dir(base_dir: Path, max_depth: int = 4) -> list[str]:
+    """Search for potential cli.js files in a directory tree."""
+    found = []
+    try:
+        for root, dirs, files in os.walk(base_dir, topdown=True):
+            # Limit depth
+            depth = len(Path(root).relative_to(base_dir).parts)
+            if depth > max_depth:
+                dirs[:] = []  # Don't recurse further
+                continue
+            
+            for f in files:
+                if f == "cli.js" or "claude" in f.lower():
+                    full_path = os.path.join(root, f)
+                    found.append(full_path)
+    except (PermissionError, OSError):
+        pass
+    return found
+
+
 def find_cli_js():
     """
     Auto-detect Claude Code cli.js location.
@@ -83,7 +105,8 @@ def find_cli_js():
     Supports:
     1. npm install -g @anthropic-ai/claude-code
     2. Official claude.ai installer
-    3. User-specific installations in /home/*/
+    3. Claude.ai versioned installer (~/.local/share/claude/versions/*)
+    4. User-specific installations in /home/*/
     """
     home = Path.home()
     is_windows = (platform.system() == "Windows") if platform else False
@@ -100,6 +123,40 @@ def find_cli_js():
     for p in explicit_paths:
         if check_path_exists(p):
             found_paths.append(str(get_resolved_path(p)))
+
+    # ==================== CLAUDE.AI VERSIONED INSTALLER ====================
+    # Check ~/.local/share/claude/versions/*/ for cli.js
+    claude_versions_dir = home / ".local" / "share" / "claude" / "versions"
+    if claude_versions_dir.exists():
+        # Find all version directories
+        for version_dir in claude_versions_dir.iterdir():
+            if version_dir.is_dir():
+                # Search for cli.js in version directory
+                for pattern in ["cli.js", "bin/claude", "resources/cli.js"]:
+                    candidate = version_dir / pattern
+                    if candidate.exists():
+                        found_paths.append(str(candidate))
+                # Deep search
+                for js_file in search_js_files_in_dir(version_dir):
+                    if "cli" in js_file.lower():
+                        found_paths.append(js_file)
+
+    # ==================== CLAUDE LOCAL BIN ====================
+    # Check ~/.local/bin/claude and resolve
+    claude_local_bin = home / ".local" / "bin" / "claude"
+    if claude_local_bin.exists():
+        try:
+            resolved = os.path.realpath(str(claude_local_bin))
+            if os.path.exists(resolved):
+                # Check if it's a directory with cli.js
+                if os.path.isdir(resolved):
+                    for js_file in search_js_files_in_dir(Path(resolved)):
+                        if "cli" in js_file.lower():
+                            found_paths.append(js_file)
+                elif "cli.js" in resolved:
+                    found_paths.append(resolved)
+        except (OSError, RuntimeError):
+            pass
 
     # ==================== WINDOWS ====================
     if is_windows:
@@ -166,29 +223,33 @@ def find_cli_js():
             pass
 
     # ==================== FALLBACK: Use 'which claude' ====================
-    if not found_paths:
-        try:
-            import subprocess
-            result = subprocess.run(
-                ["which", "claude"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                claude_bin = result.stdout.strip()
-                # Resolve symlink to get actual cli.js
-                resolved = os.path.realpath(claude_bin)
-                if resolved.endswith("cli.js"):
-                    found_paths.append(resolved)
-                elif "claude-code" in resolved:
-                    # Try to find cli.js in same directory
-                    cli_dir = os.path.dirname(resolved)
-                    potential_cli = os.path.join(cli_dir, "cli.js")
-                    if os.path.exists(potential_cli):
-                        found_paths.append(potential_cli)
-        except Exception:
-            pass
+    try:
+        result = subprocess.run(
+            ["which", "claude"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            claude_bin = result.stdout.strip()
+            # Resolve symlink to get actual path
+            resolved = os.path.realpath(claude_bin)
+            
+            if os.path.isdir(resolved):
+                # It's a directory, search for cli.js inside
+                for js_file in search_js_files_in_dir(Path(resolved)):
+                    if "cli" in js_file.lower():
+                        found_paths.append(js_file)
+            elif "cli.js" in resolved or "claude-code" in resolved:
+                found_paths.append(resolved)
+            else:
+                # Check parent directory for cli.js
+                parent_dir = Path(resolved).parent
+                for js_file in search_js_files_in_dir(parent_dir):
+                    if "cli" in js_file.lower():
+                        found_paths.append(js_file)
+    except Exception:
+        pass
 
     # ==================== ERROR ====================
     if not found_paths:
@@ -196,6 +257,7 @@ def find_cli_js():
             hint_paths = ["%LOCALAPPDATA%\\claude-cli", "%PROGRAMFILES%\\claude-cli"]
         else:
             hint_paths = [
+                "~/.local/share/claude/versions/",
                 "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
                 "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
                 "/opt/claude-cli",
