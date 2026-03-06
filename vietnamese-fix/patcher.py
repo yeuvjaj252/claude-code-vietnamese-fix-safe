@@ -13,9 +13,8 @@ Safety features:
 - Dry-run mode (no changes)
 - Backup with checksum verification
 - Restore from backup
-- Version info logging
 - Rollback on error
-- Multiple backup retention
+- Multiple backup retention (max 5)
 
 Usage:
   python3 patcher.py              Auto-detect and fix
@@ -29,6 +28,7 @@ Repository: https://github.com/yeuvjaj252/claude-code-vietnamese-fix-safe
 License: MIT
 """
 
+import glob
 import hashlib
 import os
 import re
@@ -60,22 +60,20 @@ def sha256_file(filepath: str) -> str:
     return sha256_hash.hexdigest()
 
 
-def candidate_paths(base: Path) -> list[str]:
-    """Generate candidate cli.js paths under a base directory."""
-    paths = []
-    # direct cli.js
-    direct_cli = base / "cli.js"
-    if direct_cli.exists():
-        paths.append(str(direct_cli))
-    # scoped package path
-    scoped_cli = base / "@anthropic-ai" / "claude-code" / "cli.js"
-    if scoped_cli.exists():
-        paths.append(str(scoped_cli))
-    # common lib/cli.js pattern
-    lib_cli = base / "lib" / "cli.js"
-    if lib_cli.exists():
-        paths.append(str(lib_cli))
-    return paths
+def check_path_exists(path: Path) -> bool:
+    """Check if a path exists, handling symlinks."""
+    try:
+        return path.exists() or path.resolve().exists()
+    except (OSError, RuntimeError):
+        return False
+
+
+def get_resolved_path(path: Path):
+    """Get resolved path, handling symlinks."""
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path
 
 
 def find_cli_js():
@@ -85,10 +83,25 @@ def find_cli_js():
     Supports:
     1. npm install -g @anthropic-ai/claude-code
     2. Official claude.ai installer
+    3. User-specific installations in /home/*/
     """
     home = Path.home()
     is_windows = (platform.system() == "Windows") if platform else False
 
+    found_paths: list[str] = []
+
+    # ==================== EXPLICIT PATHS (highest priority) ====================
+    explicit_paths = [
+        Path("/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"),
+        Path("/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"),
+        Path("/opt/homebrew/lib/node_modules/@anthropic-ai/claude-code/cli.js"),
+    ]
+
+    for p in explicit_paths:
+        if check_path_exists(p):
+            found_paths.append(str(get_resolved_path(p)))
+
+    # ==================== WINDOWS ====================
     if is_windows:
         search_dirs = [
             Path(os.environ.get("LOCALAPPDATA", "")) / "npm-cache" / "_npx",
@@ -96,49 +109,110 @@ def find_cli_js():
             Path(os.environ.get("LOCALAPPDATA", "")) / "claude-cli",
             Path(os.environ.get("PROGRAMFILES", "")) / "claude-cli",
         ]
+    # ==================== LINUX / MACOS ====================
     else:
         search_dirs = [
+            # User home directories
             home / ".npm" / "_npx",
             home / ".nvm" / "versions" / "node",
-            Path("/usr/local/lib/node_modules"),
+            home / ".local" / "lib" / "node_modules",
+            home / ".claude-cli",
+            # System directories
             Path("/usr/lib/node_modules"),
+            Path("/usr/local/lib/node_modules"),
             Path("/opt/homebrew/lib/node_modules"),
-            # official installers
+            # Official installers
             Path("/opt/claude-cli"),
             Path("/usr/local/claude-cli"),
-            home / ".claude-cli",
             Path("/opt/homebrew/opt/claude-cli"),
             Path("/usr/local/opt/claude-cli"),
+            # Claude Code Router (if installed)
+            home / ".claude-code-router",
         ]
 
-    found_paths: list[str] = []
+        # Add all /home/*/ directories for multi-user VPS
+        for home_dir in Path("/home").glob("*"):
+            if home_dir.is_dir():
+                search_dirs.append(home_dir / ".npm" / "_npx")
+                search_dirs.append(home_dir / ".nvm" / "versions" / "node")
+                search_dirs.append(home_dir / ".local" / "lib" / "node_modules")
+                search_dirs.append(home_dir / ".claude-cli")
 
+    # ==================== SEARCH IN DIRECTORIES ====================
     for directory in search_dirs:
         if not directory.exists():
             continue
-        # direct candidates
-        for p in candidate_paths(directory):
-            found_paths.append(p)
-        # rglob search for scoped package
+
+        # Direct cli.js
+        direct_cli = directory / "cli.js"
+        if direct_cli.exists():
+            found_paths.append(str(direct_cli))
+
+        # Scoped package path
+        scoped_cli = directory / "@anthropic-ai" / "claude-code" / "cli.js"
+        if scoped_cli.exists():
+            found_paths.append(str(scoped_cli))
+
+        # lib/cli.js pattern (common in claude.ai installer)
+        lib_cli = directory / "lib" / "cli.js"
+        if lib_cli.exists():
+            found_paths.append(str(lib_cli))
+
+        # Recursive search for scoped package
         try:
             for cli_js in directory.rglob("@anthropic-ai/claude-code/cli.js"):
                 found_paths.append(str(cli_js))
         except (PermissionError, OSError):
             pass
 
+    # ==================== FALLBACK: Use 'which claude' ====================
+    if not found_paths:
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["which", "claude"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                claude_bin = result.stdout.strip()
+                # Resolve symlink to get actual cli.js
+                resolved = os.path.realpath(claude_bin)
+                if resolved.endswith("cli.js"):
+                    found_paths.append(resolved)
+                elif "claude-code" in resolved:
+                    # Try to find cli.js in same directory
+                    cli_dir = os.path.dirname(resolved)
+                    potential_cli = os.path.join(cli_dir, "cli.js")
+                    if os.path.exists(potential_cli):
+                        found_paths.append(potential_cli)
+        except Exception:
+            pass
+
+    # ==================== ERROR ====================
     if not found_paths:
         if is_windows:
             hint_paths = ["%LOCALAPPDATA%\\claude-cli", "%PROGRAMFILES%\\claude-cli"]
         else:
-            hint_paths = ["/opt/claude-cli", "/usr/local/claude-cli", "~/.claude-cli", "/usr/lib/node_modules"]
+            hint_paths = [
+                "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                "/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js",
+                "/opt/claude-cli",
+                "/usr/local/claude-cli",
+                "~/.claude-cli",
+            ]
         raise FileNotFoundError(
             "Không tìm thấy Claude Code installation.\n\n"
             "Cài đặt bằng một trong các cách:\n"
             "  1. npm: npm install -g @anthropic-ai/claude-code\n"
             "  2. Official: curl -fsSL https://claude.ai/install.sh | bash\n\n"
-            f"Kiểm tra các đường dẫn: {', '.join(hint_paths)}"
+            f"Kiểm tra các đường dẫn: {', '.join(hint_paths)}\n\n"
+            "Hoặc dùng: python3 patcher.py --path /path/to/cli.js"
         )
 
+    # Return the most recently modified one
+    found_paths = list(dict.fromkeys(found_paths))  # Remove duplicates, preserve order
     found_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return found_paths[0]
 
