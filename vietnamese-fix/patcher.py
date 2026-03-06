@@ -47,6 +47,10 @@ DEL_CHAR = chr(127)  # 0x7F - character used by Vietnamese IME for backspace
 MAX_BACKUPS = 5  # Keep max 5 backups
 
 
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
 def sha256_file(filepath: str) -> str:
     """Calculate SHA256 checksum of a file."""
     sha256_hash = hashlib.sha256()
@@ -56,36 +60,50 @@ def sha256_file(filepath: str) -> str:
     return sha256_hash.hexdigest()
 
 
+def candidate_paths(base: Path) -> list[str]:
+    """Generate candidate cli.js paths under a base directory."""
+    paths = []
+    # direct cli.js
+    direct_cli = base / "cli.js"
+    if direct_cli.exists():
+        paths.append(str(direct_cli))
+    # scoped package path
+    scoped_cli = base / "@anthropic-ai" / "claude-code" / "cli.js"
+    if scoped_cli.exists():
+        paths.append(str(scoped_cli))
+    # common lib/cli.js pattern
+    lib_cli = base / "lib" / "cli.js"
+    if lib_cli.exists():
+        paths.append(str(lib_cli))
+    return paths
+
+
 def find_cli_js():
     """
     Auto-detect Claude Code cli.js location.
-    
+
     Supports:
     1. npm install -g @anthropic-ai/claude-code
-    2. curl -fsSL https://claude.ai/install.sh | bash (official installer)
+    2. Official claude.ai installer
     """
     home = Path.home()
     is_windows = (platform.system() == "Windows") if platform else False
 
-    # ==================== WINDOWS ====================
     if is_windows:
         search_dirs = [
             Path(os.environ.get("LOCALAPPDATA", "")) / "npm-cache" / "_npx",
             Path(os.environ.get("APPDATA", "")) / "npm" / "node_modules",
-            # claude.ai installer paths (Windows)
             Path(os.environ.get("LOCALAPPDATA", "")) / "claude-cli",
             Path(os.environ.get("PROGRAMFILES", "")) / "claude-cli",
         ]
-    # ==================== LINUX / MACOS ====================
     else:
         search_dirs = [
-            # npm paths
             home / ".npm" / "_npx",
             home / ".nvm" / "versions" / "node",
             Path("/usr/local/lib/node_modules"),
-            Path("/opt/homebrew/lib/node_modules"),
             Path("/usr/lib/node_modules"),
-            # claude.ai official installer paths
+            Path("/opt/homebrew/lib/node_modules"),
+            # official installers
             Path("/opt/claude-cli"),
             Path("/usr/local/claude-cli"),
             home / ".claude-cli",
@@ -93,39 +111,26 @@ def find_cli_js():
             Path("/usr/local/opt/claude-cli"),
         ]
 
-    # Search for cli.js in all directories
-    found_paths = []
+    found_paths: list[str] = []
+
     for directory in search_dirs:
-        if directory.exists():
-            # Direct cli.js in directory
-            direct_cli = directory / "cli.js"
-            if direct_cli.exists():
-                found_paths.append(str(direct_cli))
-            # Recursive search for @anthropic-ai/claude-code/cli.js
-            try:
-                for cli_js in directory.rglob("*/@anthropic-ai/claude-code/cli.js"):
-                    found_paths.append(str(cli_js))
-            except (PermissionError, OSError):
-                pass
-            # Also check for lib/cli.js pattern (common in claude.ai installer)
-            lib_cli = directory / "lib" / "cli.js"
-            if lib_cli.exists():
-                found_paths.append(str(lib_cli))
+        if not directory.exists():
+            continue
+        # direct candidates
+        for p in candidate_paths(directory):
+            found_paths.append(p)
+        # rglob search for scoped package
+        try:
+            for cli_js in directory.rglob("@anthropic-ai/claude-code/cli.js"):
+                found_paths.append(str(cli_js))
+        except (PermissionError, OSError):
+            pass
 
     if not found_paths:
-        # Build helpful error message
         if is_windows:
-            hint_paths = [
-                "%LOCALAPPDATA%\\claude-cli",
-                "%PROGRAMFILES%\\claude-cli",
-            ]
+            hint_paths = ["%LOCALAPPDATA%\\claude-cli", "%PROGRAMFILES%\\claude-cli"]
         else:
-            hint_paths = [
-                "/opt/claude-cli",
-                "/usr/local/claude-cli",
-                "~/.claude-cli",
-            ]
-        
+            hint_paths = ["/opt/claude-cli", "/usr/local/claude-cli", "~/.claude-cli", "/usr/lib/node_modules"]
         raise FileNotFoundError(
             "Không tìm thấy Claude Code installation.\n\n"
             "Cài đặt bằng một trong các cách:\n"
@@ -134,13 +139,15 @@ def find_cli_js():
             f"Kiểm tra các đường dẫn: {', '.join(hint_paths)}"
         )
 
-    # Return the most recently modified one
     found_paths.sort(key=lambda p: os.path.getmtime(p), reverse=True)
     return found_paths[0]
 
 
+# ---------------------------------------------------------------------------
+# Patch logic
+# ---------------------------------------------------------------------------
+
 def find_bug_block(content: str):
-    """Find the if-block containing the Vietnamese IME bug pattern."""
     pattern = f'.includes("{DEL_CHAR}")'
     idx = content.find(pattern)
 
@@ -150,12 +157,10 @@ def find_bug_block(content: str):
             "Claude Code có thể đã được Anthropic fix."
         )
 
-    # Find the containing if(
     block_start = content.rfind("if(", max(0, idx - 150), idx)
     if block_start == -1:
         raise RuntimeError("Không tìm thấy block if chứa pattern")
 
-    # Find matching closing brace
     depth = 0
     block_end = idx
     for i, c in enumerate(content[block_start:block_start + 800]):
@@ -174,10 +179,8 @@ def find_bug_block(content: str):
 
 
 def extract_variables(block: str):
-    """Extract dynamic variable names from the bug block."""
     normalized = block.replace(DEL_CHAR, "\\x7f")
 
-    # Match: let COUNT=(INPUT.match(/\x7f/g)||[]).length,STATE=CURSTATE;
     match = re.search(
         r"let ([\w$]+)=\(\w+\.match\(/\\x7f/g\)\|\|\[\]\)\.length[,;]([\w$]+)=([\w$]+)[;,]",
         normalized,
@@ -187,7 +190,6 @@ def extract_variables(block: str):
 
     state, cur_state = match.group(2), match.group(3)
 
-    # Match: UPDATETEXT(STATE.text);UPDATEOFFSET(STATE.offset)
     match_update = re.search(
         rf"([\w$]+)\({re.escape(state)}\.text\);([\w$]+)\({re.escape(state)}\.offset\)",
         block,
@@ -195,7 +197,6 @@ def extract_variables(block: str):
     if not match_update:
         raise RuntimeError("Không trích xuất được update functions")
 
-    # Match: INPUT.includes("
     match_input = re.search(r"([\w$]+)\.includes\(\"", block)
     if not match_input:
         raise RuntimeError("Không trích xuất được input variable")
@@ -210,7 +211,6 @@ def extract_variables(block: str):
 
 
 def generate_fix(vars_map: dict) -> str:
-    """Generate the fix code that does backspace + insert replacement text."""
     return (
         f"{PATCH_MARKER}"
         f"if({vars_map['input']}.includes(\"\\x7f\")){{"
@@ -228,7 +228,6 @@ def generate_fix(vars_map: dict) -> str:
 
 
 def find_backups(file_path: str):
-    """Find all backup files for a given file."""
     dir_path = os.path.dirname(file_path) or "."
     filename = os.path.basename(file_path)
     backups = [
@@ -241,13 +240,11 @@ def find_backups(file_path: str):
 
 
 def find_latest_backup(file_path: str):
-    """Find the most recent backup file."""
     backups = find_backups(file_path)
     return backups[0] if backups else None
 
 
 def cleanup_old_backups(file_path: str):
-    """Keep only MAX_BACKUPS most recent backups."""
     backups = find_backups(file_path)
     for old_backup in backups[MAX_BACKUPS:]:
         try:
@@ -257,14 +254,12 @@ def cleanup_old_backups(file_path: str):
 
 
 def patch(file_path: str, dry_run: bool = False):
-    """Apply Vietnamese IME fix to cli.js."""
     print(f"-> File: {file_path}")
 
     if not os.path.exists(file_path):
         print(f"Lỗi: File không tồn tại: {file_path}", file=sys.stderr)
         return 1
 
-    # Checksum before
     original_checksum = sha256_file(file_path)
     print(f"   SHA256: {original_checksum[:16]}...")
 
@@ -285,7 +280,6 @@ def patch(file_path: str, dry_run: bool = False):
             print(f"   Warning: {e}")
         return 0
 
-    # Backup with checksum
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     backup_path = f"{file_path}.backup-{timestamp}"
     shutil.copy2(file_path, backup_path)
@@ -298,10 +292,7 @@ def patch(file_path: str, dry_run: bool = False):
         return 1
 
     try:
-        # Find bug block
         block_start, block_end, block = find_bug_block(content)
-
-        # Extract variables
         variables = extract_variables(block)
         print(
             "   Vars: input={input}, state={state}, cur={cur}".format(
@@ -309,15 +300,12 @@ def patch(file_path: str, dry_run: bool = False):
             )
         )
 
-        # Generate fix and replace
         fix_code = generate_fix(variables)
         patched = content[:block_start] + fix_code + content[block_end:]
 
-        # Write
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(patched)
 
-        # Verify
         with open(file_path, "r", encoding="utf-8") as f:
             new_content = f.read()
             if PATCH_MARKER not in new_content:
@@ -326,7 +314,6 @@ def patch(file_path: str, dry_run: bool = False):
         new_checksum = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
         print(f"   New SHA256: {new_checksum[:16]}...")
 
-        # Cleanup old backups
         cleanup_old_backups(file_path)
 
         print("\n   Patch thành công! Khởi động lại Claude Code.\n")
@@ -338,7 +325,6 @@ def patch(file_path: str, dry_run: bool = False):
             "Báo lỗi tại: https://github.com/yeuvjaj252/claude-code-vietnamese-fix-safe/issues",
             file=sys.stderr,
         )
-        # Rollback
         if os.path.exists(backup_path):
             shutil.copy2(backup_path, file_path)
             os.remove(backup_path)
@@ -347,13 +333,11 @@ def patch(file_path: str, dry_run: bool = False):
 
 
 def restore(file_path: str):
-    """Restore file from latest backup."""
     backup = find_latest_backup(file_path)
     if not backup:
         print(f"Không tìm thấy backup cho {file_path}", file=sys.stderr)
         return 1
 
-    # Verify backup integrity
     backup_checksum = sha256_file(backup)
     print(f"Backup SHA256: {backup_checksum[:16]}...")
 
@@ -364,7 +348,6 @@ def restore(file_path: str):
 
 
 def show_info():
-    """Show CLI information."""
     print("Claude Code Vietnamese IME Fix - Info\n")
     try:
         cli_path = find_cli_js()
@@ -385,7 +368,6 @@ def show_info():
 
 
 def show_help():
-    """Hiển thị hướng dẫn sử dụng."""
     print("Claude Code Vietnamese IME Fix - Safe Edition")
     print("")
     print("Sử dụng:")
@@ -402,7 +384,6 @@ def show_help():
 def main():
     args = sys.argv[1:]
 
-    # treat --auto as default behavior
     if "--auto" in args:
         args = [a for a in args if a != "--auto"]
 
