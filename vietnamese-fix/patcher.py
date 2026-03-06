@@ -2,8 +2,12 @@
 """
 Claude Code Vietnamese IME Fix - Safe Edition
 
-Fixes Vietnamese input bug in Claude Code CLI (npm) by patching
+Fixes Vietnamese input bug in Claude Code CLI by patching
 the backspace handling logic to also insert replacement text.
+
+Supports:
+- npm install -g @anthropic-ai/claude-code
+- curl -fsSL https://claude.ai/install.sh | bash (official installer)
 
 Safety features:
 - Dry-run mode (no changes)
@@ -21,7 +25,7 @@ Usage:
   python3 patcher.py --info       Show CLI info
   python3 patcher.py --help       Show help
 
-Repository: https://github.com/manhit96/claude-code-vietnamese-fix
+Repository: https://github.com/yeuvjaj252/claude-code-vietnamese-fix-safe
 License: MIT
 """
 
@@ -53,34 +57,81 @@ def sha256_file(filepath: str) -> str:
 
 
 def find_cli_js():
-    """Auto-detect Claude Code npm cli.js location."""
+    """
+    Auto-detect Claude Code cli.js location.
+    
+    Supports:
+    1. npm install -g @anthropic-ai/claude-code
+    2. curl -fsSL https://claude.ai/install.sh | bash (official installer)
+    """
     home = Path.home()
     is_windows = (platform.system() == "Windows") if platform else False
 
+    # ==================== WINDOWS ====================
     if is_windows:
         search_dirs = [
             Path(os.environ.get("LOCALAPPDATA", "")) / "npm-cache" / "_npx",
             Path(os.environ.get("APPDATA", "")) / "npm" / "node_modules",
+            # claude.ai installer paths (Windows)
+            Path(os.environ.get("LOCALAPPDATA", "")) / "claude-cli",
+            Path(os.environ.get("PROGRAMFILES", "")) / "claude-cli",
         ]
+    # ==================== LINUX / MACOS ====================
     else:
         search_dirs = [
+            # npm paths
             home / ".npm" / "_npx",
             home / ".nvm" / "versions" / "node",
             Path("/usr/local/lib/node_modules"),
             Path("/opt/homebrew/lib/node_modules"),
             Path("/usr/lib/node_modules"),
+            # claude.ai official installer paths
+            Path("/opt/claude-cli"),
+            Path("/usr/local/claude-cli"),
+            home / ".claude-cli",
+            Path("/opt/homebrew/opt/claude-cli"),
+            Path("/usr/local/opt/claude-cli"),
         ]
 
+    # Search for cli.js in all directories
     found_paths = []
     for directory in search_dirs:
         if directory.exists():
-            for cli_js in directory.rglob("*/@anthropic-ai/claude-code/cli.js"):
-                found_paths.append(str(cli_js))
+            # Direct cli.js in directory
+            direct_cli = directory / "cli.js"
+            if direct_cli.exists():
+                found_paths.append(str(direct_cli))
+            # Recursive search for @anthropic-ai/claude-code/cli.js
+            try:
+                for cli_js in directory.rglob("*/@anthropic-ai/claude-code/cli.js"):
+                    found_paths.append(str(cli_js))
+            except (PermissionError, OSError):
+                pass
+            # Also check for lib/cli.js pattern (common in claude.ai installer)
+            lib_cli = directory / "lib" / "cli.js"
+            if lib_cli.exists():
+                found_paths.append(str(lib_cli))
 
     if not found_paths:
+        # Build helpful error message
+        if is_windows:
+            hint_paths = [
+                "%LOCALAPPDATA%\\claude-cli",
+                "%PROGRAMFILES%\\claude-cli",
+            ]
+        else:
+            hint_paths = [
+                "/opt/claude-cli",
+                "/usr/local/claude-cli",
+                "~/.claude-cli",
+            ]
+        
         raise FileNotFoundError(
-            "Không tìm thấy Claude Code npm.\n"
-            "Cài đặt trước: npm install -g @anthropic-ai/claude-code"
+            "Không tìm thấy Claude Code installation.\n\n"
+            "Cài đặt bằng một trong các cách:\n"
+            "  1. npm: npm install -g @anthropic-ai/claude-code\n"
+            "  2. Official: curl -fsSL https://claude.ai/install.sh | bash\n\n"
+            f"Kiểm tra các đường dẫn: {', '.join(hint_paths)}"
         )
 
     # Return the most recently modified one
@@ -284,7 +335,7 @@ def patch(file_path: str, dry_run: bool = False):
     except Exception as exc:  # noqa: BLE001
         print(f"\nLỗi: {exc}", file=sys.stderr)
         print(
-            "Báo lỗi tại: https://github.com/manhit96/claude-code-vietnamese-fix/issues",
+            "Báo lỗi tại: https://github.com/yeuvjaj252/claude-code-vietnamese-fix-safe/issues",
             file=sys.stderr,
         )
         # Rollback
@@ -345,7 +396,7 @@ def show_help():
     print("  python3 patcher.py --info       Hiển thị thông tin CLI")
     print("  python3 patcher.py --help       Hiển thị hướng dẫn")
     print("")
-    print("https://github.com/manhit96/claude-code-vietnamese-fix")
+    print("https://github.com/yeuvjaj252/claude-code-vietnamese-fix-safe")
 
 
 def main():
