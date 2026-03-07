@@ -47,6 +47,7 @@ except ImportError:
 PATCH_MARKER = "/* Vietnamese IME fix */"
 DEL_CHAR = chr(127)  # 0x7F - character used by Vietnamese IME for backspace
 MAX_BACKUPS = 5  # Keep max 5 backups
+BUN_PRAGMA = "\x00// @bun"  # Marker in Bun-compiled binaries
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,17 @@ def get_resolved_path(path: Path):
         return path
 
 
+def is_binary_file(filepath: str) -> bool:
+    """Check if a file is a binary (not a JS text file)."""
+    try:
+        with open(filepath, "rb") as f:
+            chunk = f.read(8192)
+        # Binary files contain null bytes; JS text files don't
+        return b"\x00" in chunk
+    except (OSError, IOError):
+        return False
+
+
 def search_js_files_in_dir(base_dir: Path, max_depth: int = 4) -> list[str]:
     """Search for potential cli.js files in a directory tree."""
     found = []
@@ -100,13 +112,14 @@ def search_js_files_in_dir(base_dir: Path, max_depth: int = 4) -> list[str]:
 
 def find_cli_js():
     """
-    Auto-detect Claude Code cli.js location.
+    Auto-detect Claude Code cli.js or binary location.
 
     Supports:
-    1. npm install -g @anthropic-ai/claude-code
-    2. Official claude.ai installer
+    1. npm install -g @anthropic-ai/claude-code (cli.js)
+    2. Official claude.ai installer (binary)
     3. Claude.ai versioned installer (~/.local/share/claude/versions/*)
     4. User-specific installations in /home/*/
+    5. Bun-compiled binary executables
     """
     home = Path.home()
     is_windows = (platform.system() == "Windows") if platform else False
@@ -125,14 +138,14 @@ def find_cli_js():
             found_paths.append(str(get_resolved_path(p)))
 
     # ==================== CLAUDE.AI VERSIONED INSTALLER ====================
-    # Check ~/.local/share/claude/versions/*/ for cli.js
+    # Check ~/.local/share/claude/versions/*/ for cli.js or binary
     claude_versions_dir = home / ".local" / "share" / "claude" / "versions"
     if claude_versions_dir.exists():
         # Find all version directories
         for version_dir in claude_versions_dir.iterdir():
             if version_dir.is_dir():
-                # Search for cli.js in version directory
-                for pattern in ["cli.js", "bin/claude", "resources/cli.js"]:
+                # Search for cli.js or binary in version directory
+                for pattern in ["cli.js", "bin/claude", "claude", "resources/cli.js"]:
                     candidate = version_dir / pattern
                     if candidate.exists():
                         found_paths.append(str(candidate))
@@ -242,6 +255,9 @@ def find_cli_js():
                         found_paths.append(js_file)
             elif "cli.js" in resolved or "claude-code" in resolved:
                 found_paths.append(resolved)
+            elif os.path.isfile(resolved):
+                # Could be a binary - add it and let patch() detect type
+                found_paths.append(resolved)
             else:
                 # Check parent directory for cli.js
                 parent_dir = Path(resolved).parent
@@ -270,7 +286,7 @@ def find_cli_js():
             "  1. npm: npm install -g @anthropic-ai/claude-code\n"
             "  2. Official: curl -fsSL https://claude.ai/install.sh | bash\n\n"
             f"Kiểm tra các đường dẫn: {', '.join(hint_paths)}\n\n"
-            "Hoặc dùng: python3 patcher.py --path /path/to/cli.js"
+            "Hoặc dùng: python3 patcher.py --path /path/to/claude-or-cli.js"
         )
 
     # Return the most recently modified one
@@ -363,6 +379,65 @@ def generate_fix(vars_map: dict) -> str:
     )
 
 
+def find_bug_block_binary(content: str):
+    """Find the bug pattern in binary content (read as latin1)."""
+    pattern = f'.includes("{DEL_CHAR}")'
+    idx = content.find(pattern)
+    if idx == -1:
+        raise RuntimeError(
+            'Không tìm thấy bug pattern .includes("\\x7f") trong binary.\n'
+            "Claude Code có thể đã được Anthropic fix hoặc file không đúng."
+        )
+    return idx
+
+
+def patch_content_binary(content: str) -> str:
+    """
+    Patch a Bun-compiled binary that contains embedded JS source.
+
+    Strategy (from 0x0a0d/fix-vietnamese-claude-code):
+    1. Apply same regex replacement as JS patching
+    2. Track byte delta (new content is longer)
+    3. Find '\\x00// @bun' pragma marker
+    4. Remove `delta` bytes from comment area after pragma to keep file size
+    """
+    # Check if already patched
+    if PATCH_MARKER in content:
+        return content
+
+    # Find and extract the bug block (same logic as JS)
+    block_start, block_end, block = find_bug_block(content)
+    variables = extract_variables(block)
+    fix_code = generate_fix(variables)
+
+    original_len = len(content)
+    patched = content[:block_start] + fix_code + content[block_end:]
+    delta = len(patched) - original_len
+
+    if delta == 0:
+        return patched
+
+    # Find Bun pragma and trim bytes to maintain binary size
+    bun_idx = patched.find(BUN_PRAGMA)
+    if bun_idx == -1:
+        raise RuntimeError(
+            "Không tìm thấy Bun pragma marker trong binary.\n"
+            "File có thể không phải Bun-compiled binary."
+        )
+
+    # Find the next \n// sequence after the pragma to trim from
+    trim_start = patched.find("\n//", bun_idx)
+    if trim_start == -1:
+        raise RuntimeError(
+            "Không tìm thấy vùng comment sau Bun pragma để trim."
+        )
+
+    # Remove exactly `delta` bytes to keep binary size intact
+    patched = patched[:trim_start] + patched[trim_start + delta:]
+
+    return patched
+
+
 def find_backups(file_path: str):
     dir_path = os.path.dirname(file_path) or "."
     filename = os.path.basename(file_path)
@@ -390,7 +465,12 @@ def cleanup_old_backups(file_path: str):
 
 
 def patch(file_path: str, dry_run: bool = False):
+    binary_mode = is_binary_file(file_path)
+    file_type = "binary (Bun)" if binary_mode else "JavaScript"
+    encoding = "latin1" if binary_mode else "utf-8"
+
     print(f"-> File: {file_path}")
+    print(f"   Type: {file_type}")
 
     if not os.path.exists(file_path):
         print(f"Lỗi: File không tồn tại: {file_path}", file=sys.stderr)
@@ -399,7 +479,7 @@ def patch(file_path: str, dry_run: bool = False):
     original_checksum = sha256_file(file_path)
     print(f"   SHA256: {original_checksum[:16]}...")
 
-    with open(file_path, "r", encoding="utf-8") as f:
+    with open(file_path, "r", encoding=encoding) as f:
         content = f.read()
 
     if PATCH_MARKER in content:
@@ -407,11 +487,20 @@ def patch(file_path: str, dry_run: bool = False):
         return 0
 
     if dry_run:
-        print("\n[DRY RUN] Would patch but skipping (no changes made)")
+        print(f"\n[DRY RUN] Would patch {file_type} file but skipping (no changes made)")
         try:
-            block_start, block_end, block = find_bug_block(content)
-            variables = extract_variables(block)
-            print(f"   Vars: input={variables['input']}, state={variables['state']}, cur={variables['cur_state']}")
+            if binary_mode:
+                find_bug_block_binary(content)
+                print("   Binary contains patchable pattern.")
+                block_start, block_end, block = find_bug_block(content)
+                variables = extract_variables(block)
+                print(f"   Vars: input={variables['input']}, state={variables['state']}, cur={variables['cur_state']}")
+                bun_idx = content.find(BUN_PRAGMA)
+                print(f"   Bun pragma: {'found' if bun_idx != -1 else 'NOT FOUND'}")
+            else:
+                block_start, block_end, block = find_bug_block(content)
+                variables = extract_variables(block)
+                print(f"   Vars: input={variables['input']}, state={variables['state']}, cur={variables['cur_state']}")
         except Exception as e:
             print(f"   Warning: {e}")
         return 0
@@ -428,27 +517,44 @@ def patch(file_path: str, dry_run: bool = False):
         return 1
 
     try:
-        block_start, block_end, block = find_bug_block(content)
-        variables = extract_variables(block)
+        if binary_mode:
+            # Binary patching: apply fix + trim to maintain size
+            patched = patch_content_binary(content)
+            variables = extract_variables(find_bug_block(content)[2])
+        else:
+            # JS patching: same as before
+            block_start, block_end, block = find_bug_block(content)
+            variables = extract_variables(block)
+            fix_code = generate_fix(variables)
+            patched = content[:block_start] + fix_code + content[block_end:]
+
         print(
             "   Vars: input={input}, state={state}, cur={cur}".format(
                 input=variables["input"], state=variables["state"], cur=variables["cur_state"]
             )
         )
 
-        fix_code = generate_fix(variables)
-        patched = content[:block_start] + fix_code + content[block_end:]
-
-        with open(file_path, "w", encoding="utf-8") as f:
+        with open(file_path, "w", encoding=encoding) as f:
             f.write(patched)
 
-        with open(file_path, "r", encoding="utf-8") as f:
+        with open(file_path, "r", encoding=encoding) as f:
             new_content = f.read()
             if PATCH_MARKER not in new_content:
                 raise RuntimeError("Verify failed: patch marker not found after write")
 
-        new_checksum = hashlib.sha256(new_content.encode("utf-8")).hexdigest()
+        new_checksum = sha256_file(file_path)
         print(f"   New SHA256: {new_checksum[:16]}...")
+
+        if binary_mode:
+            # Verify binary size is preserved
+            orig_size = os.path.getsize(backup_path)
+            new_size = os.path.getsize(file_path)
+            if orig_size != new_size:
+                raise RuntimeError(
+                    f"Binary size mismatch! Original: {orig_size}, New: {new_size}. "
+                    "Binary có thể bị corrupt."
+                )
+            print(f"   Binary size: {new_size:,} bytes (preserved)")
 
         cleanup_old_backups(file_path)
 
@@ -489,14 +595,21 @@ def show_info():
         cli_path = find_cli_js()
         print(f"CLI Path: {cli_path}")
         if os.path.exists(cli_path):
+            binary_mode = is_binary_file(cli_path)
+            encoding = "latin1" if binary_mode else "utf-8"
+            file_type = "Binary (Bun-compiled)" if binary_mode else "JavaScript"
             size = os.path.getsize(cli_path)
+            print(f"File Type: {file_type}")
             print(f"File Size: {size:,} bytes")
-            with open(cli_path, "r", encoding="utf-8") as f:
+            with open(cli_path, "r", encoding=encoding) as f:
                 content = f.read()
             if PATCH_MARKER in content:
-                print("Status: PATCHED ✓")
+                print("Status: PATCHED")
             else:
                 print("Status: NOT PATCHED")
+            if binary_mode:
+                has_pragma = BUN_PRAGMA in content
+                print(f"Bun Pragma: {'found' if has_pragma else 'not found'}")
     except FileNotFoundError as e:
         print(f"Error: {e}")
     except Exception as e:
